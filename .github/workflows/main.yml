@@ -44,7 +44,7 @@ env:
   KSU_KPATCH_FIX: "https://github.com/TheSillyOk/kernel_ls_patches/raw/refs/heads/master/kpatch_fix.patch"
 
   # --- SUSFS (JackA1ltman patch, kernel-4.14) ---
-  SUSFS_PATCH_URL: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd/raw/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.14.patch"
+  SUSFS_PATCH_URL: "https://github.com/manipvlator/msm-sm6150-cafified/commit/d6cb29dcc86ad1622d6068065c8020ba6b7a6ff7.patch"
 
 jobs:
   # ------------------------------------------------------------------
@@ -199,7 +199,7 @@ jobs:
       - name: "🩹 [PATCH] :: SUSFS_INTEGRATION"
         if: inputs.ksu_selector != 'NONE'
         run: |
-          echo "⚠️ APPLYING SUSFS patch (JackA1ltman, 4.14) ..."
+          echo "⚠️ APPLYING SUSFS patch (manipvlator/msm-sm6150-cafified, v2.0.0) ..."
 
           wget -q "${{ env.SUSFS_PATCH_URL }}" -O /tmp/susfs.patch
 
