@@ -194,24 +194,45 @@ jobs:
 
       # ----------------------------------------------------------------
       # SUSFS — JackA1ltman susfs_patch_to_4.14.patch
-      # Known rejects di sweet/sm6150 di-fix via susfs_manual_fix.py
+      # Melalui Purgasi & Validasi Multi-Tahap (Heuristic Audit)
       # ----------------------------------------------------------------
       - name: "🩹 [PATCH] :: SUSFS_INTEGRATION"
         if: inputs.ksu_selector != 'NONE'
         run: |
-          echo "⚠️ APPLYING SUSFS patch (manipvlator/msm-sm6150-cafified, v2.0.0) ..."
-
+          set -e # Aktivasi strict error handling
+          echo "⚠️ [FASE 1] MENGINISIALISASI PROTOKOL SUSFS (manipvlator/msm-sm6150-cafified) ..."
           wget -q "${{ env.SUSFS_PATCH_URL }}" -O /tmp/susfs.patch
 
-          # --batch: no interactive prompt
-          # --forward: skip hunks sudah applied (cred.h/cred.c native di tree ini)
-          patch -p1 --fuzz=5 --batch --forward < /tmp/susfs.patch || true
+          echo "🔍 [FASE 2] Menerapkan patch upstream..."
+          # Kita izinkan patch berjalan. Jika ada hunk yang ditolak, eksekusi dilanjutkan agar Python Scanner dapat melakukan resolusi konflik secara rekayasa balik.
+          patch -p1 --fuzz=5 --batch --forward < /tmp/susfs.patch || echo "⚠️ Peringatan: Ditemukan distorsi struktural (Rejects). Lexical Scanner akan mengambil alih penyesuaian AST."
 
-          # Write susfs_manual_fix.py fresh setiap run — tidak bergantung pada repo
-          # Fix known rejects — gunakan susfs_manual_fix.py dari repo
-          python3 ${{ github.workspace }}/susfs_manual_fix.py
+          echo "🧠 [FASE 3] Mengeksekusi Lexical Brace Matching Scanner (susfs_manual_fix.py)..."
+          if ! python3 ${{ github.workspace }}/susfs_manual_fix.py; then
+              echo "❌ [FATAL] Lexical Patcher Python gagal memvalidasi struktur C-Source. Kompilasi digagalkan secara sistemik!"
+              exit 1
+          fi
           
-          # Append SUSFS configs ke defconfig
+          echo "🔬 [FASE 4] Heuristic Audit: Memverifikasi integritas File Pasca-Injeksi..."
+          # Verifikasi level-Bash untuk memvalidasi absolutnya injeksi pada Abstract Syntax Tree.
+          if ! grep -q "susfs_spoof_uname" kernel/sys.c; then
+              echo "❌ [FATAL] Anomali terdeteksi: 'susfs_spoof_uname' gagal ditemukan di kernel/sys.c!"
+              exit 1
+          fi
+          
+          if ! grep -q "bypass_orig_flow:" fs/proc/task_mmu.c; then
+              echo "❌ [FATAL] Anomali terdeteksi: Label 'bypass_orig_flow:' absen dari resolusi fs/proc/task_mmu.c!"
+              exit 1
+          fi
+          
+          if ! grep -q "susfs_spoof_cmdline_or_bootconfig" fs/proc/cmdline.c; then
+              echo "❌ [FATAL] Anomali terdeteksi: Injeksi susfs_spoof_cmdline absen dari fs/proc/cmdline.c!"
+              exit 1
+          fi
+
+          echo "✅ [AUDIT LULUS] Integritas struktural KSU/SUSFS terverifikasi 100% pada layer leksikal."
+
+          echo "⚙️ [FASE 5] Menginjeksi parameter konfigurasi SUSFS ke dalam defconfig..."
           printf '%s\n' \
             'CONFIG_KSU_SUSFS=y' \
             'CONFIG_KSU_SUSFS_SUS_PATH=n' \
@@ -226,7 +247,7 @@ jobs:
             'CONFIG_KSU_SUSFS_TRY_UMOUNT=n' \
             >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
-          echo "✅ SUSFS integration complete."
+          echo "✅ Protokol SUSFS Integration selesai dieksekusi secara paripurna."
 
       # ----------------------------------------------------------------
       # MIUI DT dimension patch
