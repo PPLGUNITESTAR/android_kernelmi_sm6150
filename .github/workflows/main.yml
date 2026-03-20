@@ -244,20 +244,20 @@ jobs:
             wget -q "$URL" -O "$PATCHFILE"
 
             # Dry-run dulu: cek apakah patch sudah applied (--reverse --dry-run)
-            if patch -p1 --dry-run --reverse --quiet < "$PATCHFILE" 2>/dev/null; then
+            if patch -p1 --dry-run --reverse --batch --quiet < "$PATCHFILE" 2>/dev/null; then
               echo "  ✓ SKIP $NAME (already applied)"
               rm -f "$PATCHFILE"
               return 0
             fi
 
             # Cek apakah bisa di-apply bersih
-            if patch -p1 --dry-run --quiet --fuzz=3 < "$PATCHFILE" 2>/dev/null; then
-              patch -p1 --fuzz=3 --quiet < "$PATCHFILE"
+            if patch -p1 --dry-run --batch --quiet --fuzz=3 < "$PATCHFILE" 2>/dev/null; then
+              patch -p1 --fuzz=3 --batch --quiet < "$PATCHFILE"
               echo "  ✅ APPLIED $NAME"
             else
               # Coba dengan fuzz lebih tinggi
-              if patch -p1 --dry-run --quiet --fuzz=5 < "$PATCHFILE" 2>/dev/null; then
-                patch -p1 --fuzz=5 --quiet < "$PATCHFILE"
+              if patch -p1 --dry-run --batch --quiet --fuzz=5 < "$PATCHFILE" 2>/dev/null; then
+                patch -p1 --fuzz=5 --batch --quiet < "$PATCHFILE"
                 echo "  ✅ APPLIED $NAME (fuzz=5)"
               else
                 echo "  ❌ FAILED $NAME — patch could not be applied cleanly"
