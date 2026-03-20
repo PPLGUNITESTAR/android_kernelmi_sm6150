@@ -158,7 +158,8 @@ elif goto_present and label_present:
                 func_end2 = i
                 break
         if func_end2 is not None:
-            lines.insert(func_end2, "bypass_orig_flow:")
+            # Inject label + null statement (;) untuk avoid C23 "label at end of compound statement"
+            lines.insert(func_end2, "bypass_orig_flow: ;")
             with open("fs/proc/task_mmu.c", "w") as f:
                 f.write("\n".join(lines))
             print(f"  OK  fs/proc/task_mmu.c label re-injected before line {func_end2+1}")
@@ -167,6 +168,14 @@ elif goto_present and label_present:
             sys.exit(1)
     else:
         print(f"  OK  goto (line {goto_line+1}) and label (line {label_line+1}) in same function")
+        # Cek apakah label punya null statement (avoid C23 warning → error)
+        lines = content.split("\n")
+        label_line2 = next(i for i, l in enumerate(lines) if "bypass_orig_flow:" in l and "goto" not in l)
+        if lines[label_line2].strip() == "bypass_orig_flow:":
+            lines[label_line2] = "bypass_orig_flow: ;"
+            with open("fs/proc/task_mmu.c", "w") as f:
+                f.write("\n".join(lines))
+            print("  OK  fs/proc/task_mmu.c label null-statement added")
 elif goto_present and not label_present:
     print("  Label missing, injecting...")
     lines = content.split("\n")
@@ -179,13 +188,70 @@ elif goto_present and not label_present:
             func_end = i
             break
     if func_end is not None:
-        lines.insert(func_end, "bypass_orig_flow:")
+        lines.insert(func_end, "bypass_orig_flow: ;")
         with open("fs/proc/task_mmu.c", "w") as f:
             f.write("\n".join(lines))
         print(f"  OK  label injected before closing brace at line {func_end+1}")
     else:
         print("  ERR cannot find function end")
         sys.exit(1)
+
+# ── Fix C2: fs/proc/task_mmu.c — show_map_vma call site & missing functions ──
+# Patch SUSFS mengubah show_map_vma signature jadi 3 args (tambah is_pid)
+# Hunk #5 yang failed berisi: update call site + definisi __show_smap
+# Perlu fix manual:
+#   1. show_map_vma(m, vma) → show_map_vma(m, vma, 1)  di call site
+#   2. __show_smap tidak ada di tree ini → ganti dengan show_smap
+#   3. arch_pkeys_enabled / vma_pkey tidak ada → wrap dengan #ifdef
+print("Fixing fs/proc/task_mmu.c call sites ...")
+with open("fs/proc/task_mmu.c", "r") as f:
+    tmu = f.read()
+
+changed = False
+
+# Fix 1: show_map_vma(m, vma) → show_map_vma(m, vma, 1)
+# Hanya fix call site yang 2 argumen, bukan deklarasi fungsi itu sendiri
+import re as _re
+# Pattern: show_map_vma(m, vma) diikuti ; atau ) — tapi bukan deklarasi fungsi
+tmu_new = _re.sub(
+    r'show_map_vma\(m,\s*vma\)(?=\s*;)',
+    'show_map_vma(m, vma, 1)',
+    tmu
+)
+if tmu_new != tmu:
+    print("  OK  show_map_vma call site updated to 3 args")
+    tmu = tmu_new
+    changed = True
+else:
+    print("  OK  show_map_vma call site already OK or not found")
+
+# Fix 2: __show_smap → show_smap (fungsi ini tidak ada di tree, yang ada show_smap)
+if "__show_smap" in tmu:
+    tmu = tmu.replace("__show_smap(", "show_smap(")
+    print("  OK  __show_smap → show_smap")
+    changed = True
+else:
+    print("  OK  no __show_smap reference")
+
+# Fix 3: arch_pkeys_enabled dan vma_pkey tidak ada di tree ini — guard dengan #ifdef
+if "arch_pkeys_enabled()" in tmu and "#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS" not in tmu:
+    pkey_block_old = "if (arch_pkeys_enabled())"
+    pkey_block_new = "#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS\n\t\t\tif (arch_pkeys_enabled())"
+    tmu = tmu.replace(pkey_block_old, pkey_block_new, 1)
+    # Tambah #endif setelah seq_printf ProtectionKey
+    tmu = _re.sub(
+        r'(seq_printf\(m,\s*"ProtectionKey:[^;]+;)',
+        r'\1\n\t\t\t#endif /* CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS */',
+        tmu
+    )
+    print("  OK  arch_pkeys_enabled/vma_pkey wrapped with #ifdef")
+    changed = True
+else:
+    print("  OK  no arch_pkeys_enabled issue")
+
+if changed:
+    with open("fs/proc/task_mmu.c", "w") as f:
+        f.write(tmu)
 
 # ── Fix D: fs/namespace.c — SUS_MOUNT hunk (tidak kritikal) ──────────────────
 # Hunk #2 failed at 128 — ini inject susfs_alloc_unshare_ksu_vfsmnt ke mnt_alloc_group_id
