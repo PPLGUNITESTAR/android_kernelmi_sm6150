@@ -16,7 +16,7 @@ on:
           - KSU_BLXX
           - KSU_NEXT
       build_miui:
-        description: "Build MIUI variant? (Uncheck to build AOSP ONLY)"
+        description: "Build MIUI variant?"
         required: true
         type: boolean
         default: true
