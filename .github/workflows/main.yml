@@ -18,9 +18,9 @@ on:
 
 env:
   # --- NERV HQ CONFIGURATION ---
-  KERNEL_NAME: "EviLZoNE"
+  KERNEL_NAME: "FranxxCORE"
   DEVICE: "Sweet"
-  CODENAME: "ArCHDeVIL"
+  CODENAME: "EviLZoNE"
   DEFCONFIG: "sweet_defconfig"
   CLANG_VER: "r547379"
   CLANG_URL: "https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r547379.tar.gz"
@@ -207,9 +207,9 @@ jobs:
           # --forward: skip hunks sudah applied (cred.h/cred.c native di tree ini)
           patch -p1 --fuzz=5 --batch --forward < /tmp/susfs.patch || true
 
-          # Fix known rejects: kernel/sys.c + task_mmu.c + missing susfs.h includes
+          # Write susfs_manual_fix.py fresh setiap run — tidak bergantung pada repo
+          # Fix known rejects — gunakan susfs_manual_fix.py dari repo
           python3 ${{ github.workspace }}/susfs_manual_fix.py
-
           # Append SUSFS configs ke defconfig
           printf '%s\n' \
             'CONFIG_KSU_SUSFS=y' \
@@ -226,7 +226,7 @@ jobs:
             >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
           echo "✅ SUSFS integration complete."
-          
+
       # ----------------------------------------------------------------
       # MIUI DT dimension patch
       # ----------------------------------------------------------------
