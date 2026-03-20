@@ -2,127 +2,135 @@
 """
 susfs_manual_fix.py
 Manual patch applicator untuk known rejects SUSFS di kernel sweet (sm6150/SDM732).
-
-Fix:
-  A) kernel/sys.c      — inject susfs_spoof_uname() ke SYSCALL_DEFINE1(newuname)
-  B) fs/proc/task_mmu.c — inject label bypass_orig_flow yang gagal di hunk #5
-  C) Verify/inject susfs.h include ke semua .c yang punya susfs calls
 """
 
 import sys, os, re
 
 # ── Fix A: kernel/sys.c ──────────────────────────────────────────────────────
+# Dari .rej: patch inject extern decl + susfs_spoof_uname call ke newuname syscall
+# Anchor tidak match karena indentasi di tree mungkin berbeda (tab vs spaces)
 print("Fixing kernel/sys.c ...")
 with open("kernel/sys.c", "r") as f:
     data = f.read()
 
 if "susfs_spoof_uname" not in data:
-    anchor = "\tdown_read(&uts_sem);\n\tmemcpy(&tmp, utsname(), sizeof(tmp));\n\tup_read(&uts_sem);"
-    replacement = (
-        "\tdown_read(&uts_sem);\n"
-        "\tmemcpy(&tmp, utsname(), sizeof(tmp));\n"
-        "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
-        "\tsusfs_spoof_uname(&tmp);\n"
-        "#endif\n"
-        "\tup_read(&uts_sem);"
-    )
-    extern_anchor = "SYSCALL_DEFINE1(newuname,"
-    extern_inject = (
+    # Cari SYSCALL_DEFINE1(newuname dengan regex — tidak peduli indentasi
+    # Inject extern decl tepat sebelumnya
+    extern_decl = (
         "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
         "extern void susfs_spoof_uname(struct new_utsname* tmp);\n"
         "#endif\n"
-        "SYSCALL_DEFINE1(newuname,"
     )
-    if anchor in data:
-        data = data.replace(extern_anchor, extern_inject, 1)
-        data = data.replace(anchor, replacement, 1)
+    call_inject = (
+        "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+        "\tsusfs_spoof_uname(&tmp);\n"
+        "#endif\n"
+    )
+
+    # Inject extern sebelum SYSCALL_DEFINE1(newuname
+    if "SYSCALL_DEFINE1(newuname," in data:
+        data = data.replace(
+            "SYSCALL_DEFINE1(newuname,",
+            extern_decl + "SYSCALL_DEFINE1(newuname,",
+            1
+        )
+        print("  OK  extern decl injected")
+    else:
+        print("  ERR SYSCALL_DEFINE1(newuname not found")
+        sys.exit(1)
+
+    # Inject call setelah memcpy(&tmp, utsname(), sizeof(tmp));
+    # Cari dengan regex untuk handle tab/space variation
+    pattern = re.compile(
+        r'([ \t]*memcpy\(&tmp,\s*utsname\(\),\s*sizeof\(tmp\)\);[ \t]*\n)',
+        re.MULTILINE
+    )
+    m = pattern.search(data)
+    if m:
+        insert_pos = m.end()
+        # Build indented call — ambil indent dari baris memcpy
+        indent = re.match(r'^([ \t]*)', m.group(0)).group(1)
+        call_lines = (
+            f"{indent}#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+            f"{indent}susfs_spoof_uname(&tmp);\n"
+            f"{indent}#endif\n"
+        )
+        data = data[:insert_pos] + call_lines + data[insert_pos:]
         with open("kernel/sys.c", "w") as f:
             f.write(data)
-        print("  OK  kernel/sys.c patched")
+        print("  OK  kernel/sys.c susfs_spoof_uname call injected")
     else:
-        print("  WARN kernel/sys.c anchor not found — skipping")
+        print("  ERR memcpy(&tmp, utsname()) not found in newuname")
+        sys.exit(1)
 else:
     print("  OK  kernel/sys.c already patched")
 
 # ── Fix B: fs/proc/task_mmu.c — bypass_orig_flow label ──────────────────────
-# Hunk #5 dari SUSFS patch gagal apply (offset terlalu jauh).
-# Hunk itu menambahkan label `bypass_orig_flow:` setelah blok susfs_show_map_vma_spoofer.
-# Hunk lain yang inject `goto bypass_orig_flow;` berhasil masuk → compile error.
-#
-# Dari patch original, struktur yang diinject:
-#   if (susfs_show_map_vma_spoofer(m, vma))
-#       goto bypass_orig_flow;
-#   ... (kode original) ...
-#   bypass_orig_flow:    <- label ini yang gagal
-#
-# Kita cari `goto bypass_orig_flow;` lalu trace ke akhir blok if/for yang sama,
-# kemudian inject label di sana.
 print("Fixing fs/proc/task_mmu.c ...")
 with open("fs/proc/task_mmu.c", "r") as f:
-    data = f.read()
+    content = f.read()
 
-if "bypass_orig_flow" in data and "bypass_orig_flow:" not in data:
-    # Cari posisi goto
-    goto_idx = data.find("goto bypass_orig_flow;")
-    if goto_idx == -1:
-        print("  WARN goto bypass_orig_flow not found")
-    else:
-        # Cari akhir dari blok/statement setelah goto — yaitu `show_map_vma_end:` label
-        # atau closing brace dari fungsi show_smaps_rollup / show_map_vma
-        # Anchor yang paling aman: cari `show_map_vma_end:` atau akhir scope terdekat
-        # Dari patch: label ditempatkan tepat sebelum `show_map_vma_end:` atau sebelum
-        # baris `m_start(m, pos)` atau sebelum closing brace fungsi
-        #
-        # Strategi: cari anchor terdekat setelah goto yang merupakan label atau closing scope
-        search_region = data[goto_idx:]
+goto_present  = "goto bypass_orig_flow;" in content
+label_present = "bypass_orig_flow:" in content
 
-        # Anchor kandidat — cari yang mana yang ada
-        candidates = [
-            "\nshow_map_vma_end:",          # label eksisting di fungsi
-            "\n\trelease_task(task);",       # statement khas di akhir fungsi
-            "\n\tput_task_struct(task);",
-            "\n\ttask_unlock(task);",
-            "\n\treturn 0;\n}",              # return terakhir di fungsi
-        ]
+if not goto_present:
+    print("  OK  no goto present, nothing to fix")
+elif goto_present and label_present:
+    lines = content.split("\n")
+    goto_line  = next(i for i, l in enumerate(lines) if "goto bypass_orig_flow;" in l)
+    label_line = next(i for i, l in enumerate(lines) if "bypass_orig_flow:" in l and "goto" not in l)
 
-        inject_before = None
-        inject_pos = None
-        for cand in candidates:
-            idx = search_region.find(cand)
-            if idx != -1:
-                inject_before = cand
-                inject_pos = goto_idx + idx
+    # Temukan scope fungsi yang mengandung goto_line pakai brace counting
+    brace_depth = 0
+    func_end = None
+    for i in range(goto_line, len(lines)):
+        brace_depth += lines[i].count('{') - lines[i].count('}')
+        if brace_depth < 0:
+            func_end = i
+            break
+
+    if func_end is not None and not (goto_line < label_line < func_end):
+        print(f"  WARN label at line {label_line+1} outside function scope, fixing...")
+        # Hapus label lama
+        lines.pop(label_line)
+        # Recalculate setelah pop
+        goto_line2 = next(i for i, l in enumerate(lines) if "goto bypass_orig_flow;" in l)
+        brace_depth = 0
+        func_end2 = None
+        for i in range(goto_line2, len(lines)):
+            brace_depth += lines[i].count('{') - lines[i].count('}')
+            if brace_depth < 0:
+                func_end2 = i
                 break
-
-        if inject_pos is not None:
-            label_code = "\nbypass_orig_flow:\n"
-            data = data[:inject_pos] + label_code + data[inject_pos:]
+        if func_end2 is not None:
+            lines.insert(func_end2, "bypass_orig_flow:")
             with open("fs/proc/task_mmu.c", "w") as f:
-                f.write(data)
-            print(f"  OK  fs/proc/task_mmu.c: bypass_orig_flow label injected before '{inject_before.strip()}'")
+                f.write("\n".join(lines))
+            print(f"  OK  label re-injected at line {func_end2+1}")
         else:
-            # Fallback: inject tepat setelah goto statement + satu baris
-            # Ini less precise tapi compile akan OK
-            lines = data.split("\n")
-            for i, line in enumerate(lines):
-                if "goto bypass_orig_flow;" in line:
-                    # Cari akhir blok — scan maju sampai indentasi kembali ke level yang sama
-                    base_indent = len(line) - len(line.lstrip())
-                    for j in range(i + 1, min(i + 200, len(lines))):
-                        stripped = lines[j].strip()
-                        curr_indent = len(lines[j]) - len(lines[j].lstrip()) if lines[j].strip() else base_indent + 1
-                        if stripped and curr_indent <= base_indent and not stripped.startswith("//"):
-                            lines.insert(j, "bypass_orig_flow:")
-                            print(f"  OK  fs/proc/task_mmu.c: bypass_orig_flow injected at line {j} (fallback)")
-                            break
-                    break
-            data = "\n".join(lines)
-            with open("fs/proc/task_mmu.c", "w") as f:
-                f.write(data)
-elif "bypass_orig_flow:" in data:
-    print("  OK  fs/proc/task_mmu.c already has bypass_orig_flow label")
-elif "bypass_orig_flow" not in data:
-    print("  OK  fs/proc/task_mmu.c no bypass_orig_flow reference (patch may not have applied)")
+            print("  ERR cannot find function end")
+            sys.exit(1)
+    else:
+        print(f"  OK  goto (line {goto_line+1}) and label (line {label_line+1}) in same function")
+elif goto_present and not label_present:
+    print("  Label missing, injecting...")
+    lines = content.split("\n")
+    goto_line = next(i for i, l in enumerate(lines) if "goto bypass_orig_flow;" in l)
+    brace_depth = 0
+    func_end = None
+    for i in range(goto_line, len(lines)):
+        brace_depth += lines[i].count('{') - lines[i].count('}')
+        if brace_depth < 0:
+            func_end = i
+            break
+    if func_end is not None:
+        lines.insert(func_end, "bypass_orig_flow:")
+        with open("fs/proc/task_mmu.c", "w") as f:
+            f.write("\n".join(lines))
+        print(f"  OK  label injected before closing brace at line {func_end+1}")
+    else:
+        print("  ERR cannot find function end")
+        sys.exit(1)
 
 # ── Fix C: scan semua .c yang punya susfs calls tapi belum include susfs.h ───
 print("\nScanning for missing susfs.h includes ...")
@@ -139,17 +147,16 @@ INCLUDE_ANCHORS = [
 
 def inject_susfs_include(fpath):
     with open(fpath, "r", errors="replace") as f:
-        content = f.read()
-    if "#include <linux/susfs.h>" in content:
+        fc = f.read()
+    if "#include <linux/susfs.h>" in fc:
         return "already"
     for anchor in INCLUDE_ANCHORS:
-        if anchor in content:
-            content = content.replace(anchor, anchor + "\n#include <linux/susfs.h>", 1)
+        if anchor in fc:
+            fc = fc.replace(anchor, anchor + "\n#include <linux/susfs.h>", 1)
             with open(fpath, "w") as f:
-                f.write(content)
+                f.write(fc)
             return f"injected after '{anchor}'"
-    # Fallback: setelah include terakhir
-    lines = content.split("\n")
+    lines = fc.split("\n")
     last_inc = max((i for i, l in enumerate(lines) if l.startswith("#include ")), default=None)
     if last_inc is not None:
         lines.insert(last_inc + 1, "#include <linux/susfs.h>")
@@ -167,12 +174,12 @@ for root, dirs, files in os.walk("."):
         fpath = os.path.join(root, fname)
         try:
             with open(fpath, "r", errors="replace") as f:
-                content = f.read()
+                fc = f.read()
         except Exception:
             continue
-        if "#include <linux/susfs.h>" in content:
+        if "#include <linux/susfs.h>" in fc:
             continue
-        calls = re.findall(r'\bsusfs_\w+\s*\(', content)
+        calls = re.findall(r'\bsusfs_\w+\s*\(', fc)
         if not calls:
             continue
         found = True
@@ -180,8 +187,7 @@ for root, dirs, files in os.walk("."):
         if "FAILED" in result:
             print(f"  ERR {fpath}: {result}")
             sys.exit(1)
-        else:
-            print(f"  OK  {fpath}: {result} (calls: {calls[:3]})")
+        print(f"  OK  {fpath}: {result} (calls: {calls[:3]})")
 
 if not found:
     print("  OK  No files need susfs.h injection")
