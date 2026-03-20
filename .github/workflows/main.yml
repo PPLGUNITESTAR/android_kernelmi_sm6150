@@ -34,7 +34,7 @@ env:
   TG_TOKEN: ${{ secrets.TG_TOKEN }}
   TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-  # --- KSU SOURCES (ported from build.sh) ---
+  # --- KSU SOURCES ---
   KSU_BLXX_SETUP_URI: "https://github.com/backslashxx/KernelSU/raw/refs/heads/master/kernel/setup.sh"
   KSU_BLXX_BRANCH: "master"
   KSU_NEXT_SETUP_URI: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
@@ -43,9 +43,8 @@ env:
   KSU_UMOUNT_PATCH: "https://github.com/tbyool/android_kernel_xiaomi_sm6150/commit/64db0dfa2f8aa6c519dbf21eb65c9b89643cda3d.patch"
   KSU_KPATCH_FIX: "https://github.com/TheSillyOk/kernel_ls_patches/raw/refs/heads/master/kpatch_fix.patch"
 
-  # --- SUSFS (simonpunk/susfs4ksu, kernel-4.14) ---
-  SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
-  SUSFS_BRANCH: "kernel-4.14"
+  # --- SUSFS (JackA1ltman patch, kernel-4.14) ---
+  SUSFS_PATCH_URL: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd/raw/refs/heads/mainline/Patches/Patch/susfs_patch_to_4.14.patch"
 
 jobs:
   # ------------------------------------------------------------------
@@ -73,7 +72,6 @@ jobs:
 
   # ------------------------------------------------------------------
   # PHASE 1: PARALLEL SYNCHRONIZATION (MATRIX BUILD)
-  # Matrix: AOSP vs MIUI — KSU ditentukan dari workflow_dispatch input
   # ------------------------------------------------------------------
   synchronization:
     name: "🛡️ ${{ matrix.unit }} // BUILD"
@@ -146,9 +144,6 @@ jobs:
         run: |
           echo "⚠️ INITIATING KSU_BLXX PROTOCOL ..."
 
-          # apply_patch: download ke file dulu lalu patch --batch --forward
-          # --batch  = jangan prompt interaktif sama sekali
-          # --forward = skip kalau patch sudah applied (reversed detected), bukan error
           apply_patch() {
             local URL="$1"
             local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
@@ -159,19 +154,17 @@ jobs:
           apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
           apply_patch "${{ env.KSU_KPATCH_FIX }}"
 
-          # Setup KernelSU (hookless mode)
           curl -LSs "${{ env.KSU_BLXX_SETUP_URI }}" | bash -s ${{ env.KSU_BLXX_BRANCH }}
 
-          # Manual config enablement
-          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
-          CONFIG_KSU=y
-          CONFIG_KSU_TAMPER_SYSCALL_TABLE=y
-          CONFIG_KPROBES=y
-          CONFIG_HAVE_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-          CONFIG_KRETPROBES=y
-          CONFIG_HAVE_SYSCALL_TRACEPOINTS=y
-          EOF
+          printf '%s\n' \
+            'CONFIG_KSU=y' \
+            'CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' \
+            'CONFIG_KPROBES=y' \
+            'CONFIG_HAVE_KPROBES=y' \
+            'CONFIG_KPROBE_EVENTS=y' \
+            'CONFIG_KRETPROBES=y' \
+            'CONFIG_HAVE_SYSCALL_TRACEPOINTS=y' \
+            >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
       # ----------------------------------------------------------------
       # KSU: KSU_NEXT (KernelSU-Next, manual hook mode)
@@ -181,9 +174,6 @@ jobs:
         run: |
           echo "⚠️ INITIATING KSU_NEXT PROTOCOL ..."
 
-          # apply_patch: download ke file dulu lalu patch --batch --forward
-          # --batch  = jangan prompt interaktif sama sekali
-          # --forward = skip kalau patch sudah applied (reversed detected), bukan error
           apply_patch() {
             local URL="$1"
             local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
@@ -194,110 +184,48 @@ jobs:
           apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
           apply_patch "${{ env.KSU_KPATCH_FIX }}"
 
-          # Apply inline hook patch
           curl -LSs "${{ env.KSU_NEXT_HOOK_PATCH }}" | bash
-
-          # Setup KernelSU-Next
           curl -LSs "${{ env.KSU_NEXT_SETUP_URI }}" | bash -s ${{ env.KSU_NEXT_BRANCH }}
 
-          # Manual config enablement
-          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
-          CONFIG_KSU=y
-          KSU_MANUAL_HOOK=y
-          EOF
+          printf '%s\n' \
+            'CONFIG_KSU=y' \
+            'KSU_MANUAL_HOOK=y' \
+            >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
       # ----------------------------------------------------------------
-      # SUSFS — apply untuk KSU_BLXX dan KSU_NEXT
-      # Sumber: simonpunk/susfs4ksu kernel-4.14
+      # SUSFS — JackA1ltman susfs_patch_to_4.14.patch
+      # Known rejects di sweet/sm6150 di-fix via susfs_manual_fix.py
       # ----------------------------------------------------------------
       - name: "🩹 [PATCH] :: SUSFS_INTEGRATION"
         if: inputs.ksu_selector != 'NONE'
         run: |
-          echo "⚠️ APPLYING SUSFS (simonpunk/susfs4ksu, kernel-4.14) ..."
-          git clone -q --depth=1 -b "${{ env.SUSFS_BRANCH }}" "${{ env.SUSFS_REPO }}" susfs4ksu
+          echo "⚠️ APPLYING SUSFS patch (JackA1ltman, 4.14) ..."
 
-          # Step 1: Copy SUSFS source files langsung — zero patch conflict
-          echo "Copying SUSFS source files..."
-          cp -v susfs4ksu/kernel_patches/fs/susfs.c                   fs/
-          cp -v susfs4ksu/kernel_patches/include/linux/susfs.h        include/linux/
-          cp -v susfs4ksu/kernel_patches/include/linux/susfs_def.h    include/linux/
+          wget -q "${{ env.SUSFS_PATCH_URL }}" -O /tmp/susfs.patch
 
-          # Step 2: KSU-side enablement patch (ke folder KernelSU jika ada)
-          KSU_ENABLE_PATCH="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-          if [ -f "$KSU_ENABLE_PATCH" ] && [ -d "KernelSU" ]; then
-            echo "Applying KSU-side SUSFS enablement patch..."
-            patch -p1 -d KernelSU < "$KSU_ENABLE_PATCH" --fuzz=3 || {
-              echo "⚠️ KSU-side patch had issues, continuing..."
-            }
-          fi
+          # --batch: no interactive prompt
+          # --forward: skip hunks sudah applied (cred.h/cred.c native di tree ini)
+          patch -p1 --fuzz=5 --batch --forward < /tmp/susfs.patch || true
 
-          # Step 3: Apply kernel-side SUSFS patch
-          SUSFS_KPATCH="susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch"
-          echo "Applying kernel-side SUSFS patch..."
-          patch -p1 --fuzz=3 < "$SUSFS_KPATCH" 2>&1 | tee /tmp/susfs_patch.log || PATCH_FAILED=1
+          # Fix known rejects: kernel/sys.c + task_mmu.c + missing susfs.h includes
+          python3 ${{ github.workspace }}/susfs_manual_fix.py
 
-          # Step 4: Kalau ada .rej — dump ke log dulu sebelum apapun
-          REJ_COUNT=$(find . -name "*.rej" | wc -l)
-          if [ "$REJ_COUNT" -gt 0 ]; then
-            echo ""
-            echo "════════════════════════════════════════════════════════"
-            echo "  ⚠️  $REJ_COUNT REJECT FILE(S) DETECTED — DUMPING CONTENT"
-            echo "════════════════════════════════════════════════════════"
-            find . -name "*.rej" | sort | while read REJ; do
-              echo ""
-              echo "┌─────────────────────────────────────────"
-              echo "│ FILE: $REJ"
-              echo "└─────────────────────────────────────────"
-              cat "$REJ"
-              echo ""
-            done
-            echo "════════════════════════════════════════════════════════"
-            echo "  Salin output di atas dan share untuk manual fix."
-            echo "════════════════════════════════════════════════════════"
-
-            # Kumpulkan semua .rej ke satu folder untuk di-upload sebagai artifact
-            mkdir -p /tmp/susfs_rejects
-            find . -name "*.rej" | while read REJ; do
-              # Flatten path: fs/proc/task_mmu.c.rej -> fs__proc__task_mmu.c.rej
-              FLAT=$(echo "$REJ" | sed 's|^\./||; s|/|__|g')
-              cp "$REJ" "/tmp/susfs_rejects/$FLAT"
-            done
-          else
-            echo "✅ Patch applied cleanly, no rejects."
-          fi
-
-          # Exit kalau patch benar-benar gagal
-          if [ "${PATCH_FAILED}" = "1" ]; then
-            echo "❌ SUSFS patch failed. Check reject dump above."
-            exit 1
-          fi
-
-          # Step 5: Append SUSFS configs ke defconfig
-          echo "Appending SUSFS configs to defconfig..."
-          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=n
-          CONFIG_KSU_SUSFS_SUS_MOUNT=n
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_SUS_MAP=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=n
-          EOF
+          # Append SUSFS configs ke defconfig
+          printf '%s\n' \
+            'CONFIG_KSU_SUSFS=y' \
+            'CONFIG_KSU_SUSFS_SUS_PATH=n' \
+            'CONFIG_KSU_SUSFS_SUS_MOUNT=n' \
+            'CONFIG_KSU_SUSFS_SUS_KSTAT=y' \
+            'CONFIG_KSU_SUSFS_SPOOF_UNAME=y' \
+            'CONFIG_KSU_SUSFS_ENABLE_LOG=y' \
+            'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' \
+            'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y' \
+            'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y' \
+            'CONFIG_KSU_SUSFS_SUS_MAP=y' \
+            'CONFIG_KSU_SUSFS_TRY_UMOUNT=n' \
+            >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
           echo "✅ SUSFS integration complete."
-
-      - name: "📤 [DEBUG] :: UPLOAD_SUSFS_REJECTS"
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: susfs-rejects-${{ matrix.variant }}
-          path: /tmp/susfs_rejects/
-          if-no-files-found: ignore
-          retention-days: 3
 
       # ----------------------------------------------------------------
       # MIUI DT dimension patch
@@ -328,21 +256,22 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
 
-          # ── O3 optimization ──────────────────────────────────────────
-          echo "Applying -O3 optimization flags..."
+          # ── -O3 optimization ─────────────────────────────────────────
+          echo "Applying -O3 flags..."
           sed -i 's/KBUILD_CFLAGS\s\++=\s\+-O2/KBUILD_CFLAGS   += -O3/g' Makefile
           sed -i 's/LDFLAGS\s\++=\s\+-O2/LDFLAGS += -O3/g' Makefile
 
           # ── LTO — hanya untuk non-KSU_NEXT ───────────────────────────
-          # LTO tidak kompatibel dengan KSU_NEXT manual hook (inline hook conflict)
+          # KSU_NEXT pakai manual inline hook, tidak kompatibel dengan LTO
           if [ "${{ inputs.ksu_selector }}" != "KSU_NEXT" ]; then
-            echo "Enabling LTO_CLANG (non-KSU_NEXT build)..."
-            echo "CONFIG_LTO_CLANG=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
-            echo "CONFIG_LTO_CLANG_THIN=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
-            # Pastikan full LTO tidak konflik dengan thin
+            echo "Enabling CONFIG_LTO_CLANG_THIN..."
+            printf '%s\n' \
+              'CONFIG_LTO_CLANG=y' \
+              'CONFIG_LTO_CLANG_THIN=y' \
+              >> arch/arm64/configs/${{ env.DEFCONFIG }}
             sed -i '/CONFIG_LTO_CLANG_FULL/d' arch/arm64/configs/${{ env.DEFCONFIG }}
           else
-            echo "Skipping LTO for KSU_NEXT build (inline hook incompatibility)."
+            echo "LTO skipped for KSU_NEXT (inline hook incompatibility)."
           fi
 
           make O=out ${{ env.DEFCONFIG }}
@@ -443,12 +372,12 @@ jobs:
             **KSU Variant:** `${{ inputs.ksu_selector }}`
 
             #### 📦 DEPLOYED UNITS:
-            | Variant | KSU | SUSFS | MIUI Patch |
-            | :--- | :---: | :---: | :---: |
-            | **AOSP** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ❌ |
-            | **MIUI** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ✅ |
+            | Variant | KSU | SUSFS | LTO | MIUI Patch |
+            | :--- | :---: | :---: | :---: | :---: |
+            | **AOSP** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ❌ |
+            | **MIUI** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ✅ |
 
-            *Synchronization Ratio: 200%*
+            *Synchronization Ratio: 200% // -O3 + Full SUSFS*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
