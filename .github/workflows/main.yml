@@ -20,7 +20,7 @@ env:
   # --- NERV HQ CONFIGURATION ---
   KERNEL_NAME: "FranxxCORE"
   DEVICE: "Sweet"
-  CODENAME: "EviLZoNE"
+  CODENAME: "AHumanWorks"
   DEFCONFIG: "sweet_defconfig"
   CLANG_VER: "r547379"
   CLANG_URL: "https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r547379.tar.gz"
@@ -226,6 +226,55 @@ jobs:
             >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
           echo "✅ SUSFS integration complete."
+
+      # ----------------------------------------------------------------
+      # CUSTOM PATCHES — tambah patch baru di sini
+      # Format: "NAMA|URL"
+      # Logic: cek apakah patch sudah applied sebelum apply (idempotent)
+      # ----------------------------------------------------------------
+      - name: "🔧 [PATCH] :: CUSTOM_PATCHES"
+        run: |
+          # ── Helper: apply_custom_patch NAME URL ──────────────────────
+          apply_custom_patch() {
+            local NAME="$1"
+            local URL="$2"
+            local PATCHFILE=$(mktemp /tmp/custom_${NAME}.XXXXXX.patch)
+
+            echo "  → Fetching patch: $NAME"
+            wget -q "$URL" -O "$PATCHFILE"
+
+            # Dry-run dulu: cek apakah patch sudah applied (--reverse --dry-run)
+            if patch -p1 --dry-run --reverse --batch --quiet < "$PATCHFILE" 2>/dev/null; then
+              echo "  ✓ SKIP $NAME (already applied)"
+              rm -f "$PATCHFILE"
+              return 0
+            fi
+
+            # Cek apakah bisa di-apply bersih
+            if patch -p1 --dry-run --batch --quiet --fuzz=3 < "$PATCHFILE" 2>/dev/null; then
+              patch -p1 --fuzz=3 --batch --quiet < "$PATCHFILE"
+              echo "  ✅ APPLIED $NAME"
+            else
+              # Coba dengan fuzz lebih tinggi
+              if patch -p1 --dry-run --batch --quiet --fuzz=5 < "$PATCHFILE" 2>/dev/null; then
+                patch -p1 --fuzz=5 --batch --quiet < "$PATCHFILE"
+                echo "  ✅ APPLIED $NAME (fuzz=5)"
+              else
+                echo "  ❌ FAILED $NAME — patch could not be applied cleanly"
+                rm -f "$PATCHFILE"
+                return 1
+              fi
+            fi
+            rm -f "$PATCHFILE"
+          }
+
+          # ── Daftar custom patch — tambah baris baru di sini ──────────
+          # Format: apply_custom_patch "NAMA" "URL"
+          apply_custom_patch "thermod" "https://github.com/RapliVx/kernel_xiaomi_sweet-06c80e0a/commit/b0b2786e658986da9969ae01e6242016145707d3.patch"
+          # apply_custom_patch "patch-lain" "https://..."
+          # apply_custom_patch "patch-lain-2" "https://..."
+
+          echo "✅ Custom patches done."
 
       # ----------------------------------------------------------------
       # MIUI DT dimension patch
