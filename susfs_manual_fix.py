@@ -1,137 +1,162 @@
 #!/usr/bin/env python3
-import sys, os, re
+import sys
+import re
+import logging
+from pathlib import Path
 
-# ── kernel/sys.c ─────────────────────────────────────────────────────────────
-print("Fixing kernel/sys.c ...")
-with open("kernel/sys.c", "r") as f:
-    data = f.read()
-if "susfs_spoof_uname" not in data:
-    ed = "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n"
-    data = data.replace("SYSCALL_DEFINE1(newuname,", ed + "SYSCALL_DEFINE1(newuname,", 1)
-    m = re.search(r"([ \t]*memcpy\(&tmp,\s*utsname\(\),\s*sizeof\(tmp\)\);[ \t]*\n)", data)
-    if m:
-        ind = re.match(r"^([ \t]*)", m.group(0)).group(1)
-        inj = ind+"#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"+ind+"susfs_spoof_uname(&tmp);\n"+ind+"#endif\n"
-        data = data[:m.end()] + inj + data[m.end():]
-        open("kernel/sys.c","w").write(data)
-        print("  OK  sys.c patched")
-    else:
-        print("  ERR sys.c anchor not found"); sys.exit(1)
-else:
-    print("  OK  sys.c already patched")
+# Konfigurasi Logging yang modern (lebih informatif dari sekadar print)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+log = logging.getLogger(__name__)
 
-# ── fs/proc/cmdline.c ─────────────────────────────────────────────────────────
-print("Fixing fs/proc/cmdline.c ...")
-with open("fs/proc/cmdline.c", "r") as f:
-    data = f.read()
-if "susfs_spoof_cmdline_or_bootconfig" not in data:
+def backup_and_read(file_path: Path) -> str:
+    """Membaca isi file dan membuat backup (.bak) sebagai fail-safe."""
+    if not file_path.exists():
+        log.error(f"File {file_path} tidak ditemukan!")
+        sys.exit(1)
+    
+    content = file_path.read_text(encoding="utf-8", errors="replace")
+    backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+    backup_path.write_text(content, encoding="utf-8")
+    return content
+
+def write_file(file_path: Path, content: str):
+    """Menulis kembali isi file dengan aman."""
+    file_path.write_text(content, encoding="utf-8")
+
+def patch_sys_c(kernel_dir: Path):
+    file_path = kernel_dir / "kernel/sys.c"
+    log.info(f"Memeriksa {file_path} ...")
+    data = backup_and_read(file_path)
+
+    if "susfs_spoof_uname" in data:
+        log.info("  -> OK (Sudah di-patch sebelumnya)")
+        return
+
+    # Injeksi Header KSU
+    ksu_header = "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n"
+    data = data.replace("SYSCALL_DEFINE1(newuname,", ksu_header + "SYSCALL_DEFINE1(newuname,", 1)
+
+    # Injeksi Logika Uname menggunakan Regex yang lebih toleran (mengabaikan spasi berlebih)
+    pattern = r"([ \t]*memcpy\(&tmp,\s*utsname\(\),\s*sizeof\(tmp\)\);[ \t]*\n)"
+    match = re.search(pattern, data)
+    if not match:
+        log.error("  -> GAGAL: Anchor memcpy uname tidak ditemukan.")
+        sys.exit(1)
+
+    indent = re.match(r"^([ \t]*)", match.group(0)).group(1)
+    injection = f"{indent}#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n{indent}susfs_spoof_uname(&tmp);\n{indent}#endif\n"
+    data = data[:match.end()] + injection + data[match.end():]
+    
+    write_file(file_path, data)
+    log.info("  -> SUCCESS: sys.c berhasil dimodifikasi.")
+
+def patch_cmdline_c(kernel_dir: Path):
+    file_path = kernel_dir / "fs/proc/cmdline.c"
+    log.info(f"Memeriksa {file_path} ...")
+    data = backup_and_read(file_path)
+
+    if "susfs_spoof_cmdline_or_bootconfig" in data:
+        log.info("  -> OK (Sudah di-patch sebelumnya)")
+        return
+
+    # Injeksi Include
     if "#include <linux/susfs.h>" not in data:
-        for anc in ["#include <linux/fs.h>","#include <linux/seq_file.h>","#include <linux/uaccess.h>"]:
-            if anc in data:
-                data = data.replace(anc, anc+"\n#include <linux/susfs.h>", 1); break
-    m = re.search(r"([ \t]*return 0;\n)", data)
-    if m:
-        ind = re.match(r"^([ \t]*)", m.group(1)).group(1)
-        inj = ind+"#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"+ind+"susfs_spoof_cmdline_or_bootconfig(m);\n"+ind+"#endif\n"
-        data = data[:m.start()] + inj + data[m.start():]
-        open("fs/proc/cmdline.c","w").write(data)
-        print("  OK  cmdline.c patched")
-    else:
-        print("  WARN cmdline.c anchor not found")
-else:
-    print("  OK  cmdline.c already patched")
-
-# ── fs/proc/task_mmu.c ────────────────────────────────────────────────────────
-print("Fixing fs/proc/task_mmu.c ...")
-with open("fs/proc/task_mmu.c", "r") as f:
-    data = f.read()
-
-# Fix show_map_vma(m, vma) -> show_map_vma(m, vma, 1)
-d2 = re.sub(r"show_map_vma\(m, vma\)(?=\s*;)", "show_map_vma(m, vma, 1)", data)
-if d2 != data:
-    print("  OK  show_map_vma -> 3 args"); data = d2
-
-# Fix __show_smap -> show_smap
-if "__show_smap" in data:
-    data = data.replace("__show_smap(", "show_smap(")
-    print("  OK  __show_smap -> show_smap")
-
-# Fix arch_pkeys_enabled / vma_pkey (x86-only, tidak ada di arm64)
-if "arch_pkeys_enabled()" in data and "#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS" not in data:
-    data = data.replace(
-        "if (arch_pkeys_enabled())",
-        "#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS\n\t\t\tif (arch_pkeys_enabled())"
-    )
-    data = re.sub(
-        r'(seq_printf\(m, "ProtectionKey:[^;]+;)',
-        r'\1\n\t\t\t#endif /* CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS */',
-        data
-    )
-    print("  OK  arch_pkeys wrapped with #ifdef")
-
-# Fix bypass_orig_flow label
-lines = data.split("\n")
-gotos  = [i for i,l in enumerate(lines) if "goto bypass_orig_flow;" in l]
-labels = [i for i,l in enumerate(lines) if "bypass_orig_flow:" in l and "goto" not in l]
-
-if gotos:
-    gl = gotos[0]
-    if labels:
-        ll = labels[0]
-        d=0; fe=None
-        for i in range(gl, len(lines)):
-            d += lines[i].count("{") - lines[i].count("}")
-            if d < 0: fe=i; break
-        if fe and not (gl < ll < fe):
-            # Label di luar scope fungsi — hapus dan re-inject
-            lines.pop(ll)
-            gl2 = next(i for i,l in enumerate(lines) if "goto bypass_orig_flow;" in l)
-            d2=0; fe2=None
-            for i in range(gl2, len(lines)):
-                d2 += lines[i].count("{") - lines[i].count("}")
-                if d2 < 0: fe2=i; break
-            if fe2:
-                lines.insert(fe2, "bypass_orig_flow: ;")
-                print("  OK  bypass_orig_flow label re-injected")
-        elif lines[ll].strip() == "bypass_orig_flow:":
-            # Label di fungsi benar tapi tidak ada null statement
-            lines[ll] = "bypass_orig_flow: ;"
-            print("  OK  bypass_orig_flow null stmt added")
-        else:
-            print("  OK  bypass_orig_flow already OK")
-    else:
-        # Label belum ada sama sekali
-        d=0; fe=None
-        for i in range(gl, len(lines)):
-            d += lines[i].count("{") - lines[i].count("}")
-            if d < 0: fe=i; break
-        if fe:
-            lines.insert(fe, "bypass_orig_flow: ;")
-            print("  OK  bypass_orig_flow label injected")
-else:
-    print("  OK  no bypass_orig_flow goto found")
-
-open("fs/proc/task_mmu.c","w").write("\n".join(lines))
-
-# ── spot-check susfs.h includes ───────────────────────────────────────────────
-print("\nChecking susfs.h includes ...")
-checks = [
-    ("fs/open.c",          "#include <linux/susfs.h>", "#include <linux/fs.h>"),
-    ("fs/stat.c",          "#include <linux/susfs.h>", "#include <linux/fs.h>"),
-    ("fs/proc/task_mmu.c", "#include <linux/susfs.h>", "#include <linux/slab.h>"),
-    ("fs/proc/cmdline.c",  "#include <linux/susfs.h>", "#include <linux/fs.h>"),
-]
-for fp, need, pref in checks:
-    if not os.path.exists(fp): continue
-    fc = open(fp,"r",errors="replace").read()
-    if re.search(r"\bsusfs_\w+\s*\(", fc) and need not in fc:
-        for anc in [pref,"#include <linux/fs.h>","#include <linux/file.h>","#include <linux/slab.h>"]:
-            if anc in fc:
-                fc = fc.replace(anc, anc+"\n"+need, 1)
-                open(fp,"w").write(fc)
-                print(f"  OK  {fp}: {need} injected")
+        for anchor in ["#include <linux/fs.h>", "#include <linux/seq_file.h>", "#include <linux/uaccess.h>"]:
+            if anchor in data:
+                data = data.replace(anchor, f"{anchor}\n#include <linux/susfs.h>", 1)
                 break
-    else:
-        print(f"  OK  {fp}: OK")
 
-print("\nManual fixes done.")
+    # Injeksi Logika sebelum return 0;
+    match = re.search(r"([ \t]*return 0;\n)", data)
+    if match:
+        indent = re.match(r"^([ \t]*)", match.group(1)).group(1)
+        injection = f"{indent}#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n{indent}susfs_spoof_cmdline_or_bootconfig(m);\n{indent}#endif\n"
+        data = data[:match.start()] + injection + data[match.start():]
+        write_file(file_path, data)
+        log.info("  -> SUCCESS: cmdline.c berhasil dimodifikasi.")
+    else:
+        log.warning("  -> WARNING: Anchor 'return 0;' tidak ditemukan di cmdline.c")
+
+def patch_task_mmu_c(kernel_dir: Path):
+    file_path = kernel_dir / "fs/proc/task_mmu.c"
+    log.info(f"Memeriksa {file_path} ...")
+    data = backup_and_read(file_path)
+
+    # 1. Fix args show_map_vma
+    new_data = re.sub(r"show_map_vma\(m, vma\)(?=\s*;)", "show_map_vma(m, vma, 1)", data)
+    if new_data != data:
+        log.info("  -> OK: show_map_vma args diubah.")
+        data = new_data
+
+    # 2. Fix show_smap namespace
+    if "__show_smap" in data:
+        data = data.replace("__show_smap(", "show_smap(")
+        log.info("  -> OK: __show_smap diubah menjadi show_smap.")
+
+    # 3. Hapus logika pkeys (x86 specific)
+    if "arch_pkeys_enabled()" in data:
+        data = re.sub(r'[ \t]*if \(arch_pkeys_enabled\(\)\)\s*\n[ \t]*seq_printf\([^;]+;\n', "", data)
+        # Fallback penghapusan baris jika regex gagal
+        lines = [line for line in data.split("\n") if "arch_pkeys_enabled" not in line and "vma_pkey" not in line]
+        data = "\n".join(lines)
+        log.info("  -> OK: arch_pkeys_enabled (x86 logic) dihapus.")
+
+    # 4. Injeksi bypass_orig_flow TANPA menghitung kurung kurawal (Metode Aman)
+    # Mencari definisi fungsi show_smap, lalu mencari titik return terakhir atau bracket penutup
+    if "goto bypass_orig_flow;" in data and "bypass_orig_flow:" not in data:
+        # Cari blok fungsi show_smap
+        smap_match = re.search(r"static int show_smap\([^)]+\)\n\{(.+?)\n\}", data, re.DOTALL)
+        if smap_match:
+            func_body = smap_match.group(1)
+            # Menyisipkan label tepat sebelum 'return 0;' atau di akhir blok
+            if "return 0;" in func_body:
+                modified_body = func_body.replace("return 0;", "bypass_orig_flow: ;\n\treturn 0;", 1)
+                data = data.replace(func_body, modified_body)
+                log.info("  -> SUCCESS: Label bypass_orig_flow berhasil disuntikkan secara statis.")
+            else:
+                log.warning("  -> WARNING: Gagal menemukan return 0; dalam show_smap.")
+        else:
+            log.warning("  -> WARNING: Gagal mengekstrak blok fungsi show_smap. Label bypass_orig_flow dilewati.")
+    elif "bypass_orig_flow:" in data:
+        log.info("  -> OK: Label bypass_orig_flow sudah ada.")
+
+    write_file(file_path, data)
+
+def spot_check_includes(kernel_dir: Path):
+    log.info("Memeriksa kelengkapan include susfs.h ...")
+    checks = [
+        ("fs/open.c",          "#include <linux/susfs.h>", "#include <linux/fs.h>"),
+        ("fs/stat.c",          "#include <linux/susfs.h>", "#include <linux/fs.h>"),
+        ("fs/proc/task_mmu.c", "#include <linux/susfs.h>", "#include <linux/slab.h>"),
+        ("fs/proc/cmdline.c",  "#include <linux/susfs.h>", "#include <linux/fs.h>"),
+    ]
+    for fp_str, need, pref in checks:
+        fp = kernel_dir / fp_str
+        if not fp.exists():
+            continue
+        
+        fc = backup_and_read(fp)
+        if re.search(r"\bsusfs_\w+\s*\(", fc) and need not in fc:
+            for anc in [pref, "#include <linux/fs.h>", "#include <linux/file.h>", "#include <linux/slab.h>"]:
+                if anc in fc:
+                    fc = fc.replace(anc, f"{anc}\n{need}", 1)
+                    write_file(fp, fc)
+                    log.info(f"  -> SUCCESS {fp.name}: {need} disuntikkan.")
+                    break
+        else:
+            log.info(f"  -> OK {fp.name}: Tidak perlu injeksi.")
+
+if __name__ == "__main__":
+    # Eksekusi di direktori saat ini (sesuai workspace kamu di /workspaces/android_kernelmi_sm6150)
+    root_dir = Path.cwd()
+    log.info(f"Memulai rutinitas SUSFS Patching di: {root_dir}")
+    
+    try:
+        patch_sys_c(root_dir)
+        patch_cmdline_c(root_dir)
+        patch_task_mmu_c(root_dir)
+        spot_check_includes(root_dir)
+        log.info("Semua modifikasi manual selesai dieksekusi tanpa error.")
+    except Exception as e:
+        log.critical(f"Terjadi eksepsi tidak terduga: {e}", exc_info=True)
+        sys.exit(1)
