@@ -4,12 +4,12 @@ import re
 import logging
 from pathlib import Path
 
-# Konfigurasi Logging yang modern (lebih informatif dari sekadar print)
+# Konfigurasi Logging modern & deterministik
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 log = logging.getLogger(__name__)
 
 def backup_and_read(file_path: Path) -> str:
-    """Membaca isi file dan membuat backup (.bak) sebagai fail-safe."""
+    """Membaca isi file dan membuat backup (.bak) secara atomik."""
     if not file_path.exists():
         log.error(f"File {file_path} tidak ditemukan!")
         sys.exit(1)
@@ -36,7 +36,7 @@ def patch_sys_c(kernel_dir: Path):
     ksu_header = "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\nextern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n"
     data = data.replace("SYSCALL_DEFINE1(newuname,", ksu_header + "SYSCALL_DEFINE1(newuname,", 1)
 
-    # Injeksi Logika Uname menggunakan Regex yang lebih toleran (mengabaikan spasi berlebih)
+    # Injeksi Logika Uname menggunakan Regex yang toleran (*whitespace agnostic*)
     pattern = r"([ \t]*memcpy\(&tmp,\s*utsname\(\),\s*sizeof\(tmp\)\);[ \t]*\n)"
     match = re.search(pattern, data)
     if not match:
@@ -59,14 +59,14 @@ def patch_cmdline_c(kernel_dir: Path):
         log.info("  -> OK (Sudah di-patch sebelumnya)")
         return
 
-    # Injeksi Include
+    # Injeksi Include yang adaptif
     if "#include <linux/susfs.h>" not in data:
         for anchor in ["#include <linux/fs.h>", "#include <linux/seq_file.h>", "#include <linux/uaccess.h>"]:
             if anchor in data:
                 data = data.replace(anchor, f"{anchor}\n#include <linux/susfs.h>", 1)
                 break
 
-    # Injeksi Logika sebelum return 0;
+    # Penempatan Logika pra-return menggunakan Regex Capture
     match = re.search(r"([ \t]*return 0;\n)", data)
     if match:
         indent = re.match(r"^([ \t]*)", match.group(1)).group(1)
@@ -82,48 +82,100 @@ def patch_task_mmu_c(kernel_dir: Path):
     log.info(f"Memeriksa {file_path} ...")
     data = backup_and_read(file_path)
 
-    # 1. Fix args show_map_vma
+    # 1. Transmutasi argumen show_map_vma
     new_data = re.sub(r"show_map_vma\(m, vma\)(?=\s*;)", "show_map_vma(m, vma, 1)", data)
     if new_data != data:
         log.info("  -> OK: show_map_vma args diubah.")
         data = new_data
 
-    # 2. Fix show_smap namespace
+    # 2. Koreksi namespace show_smap
     if "__show_smap" in data:
         data = data.replace("__show_smap(", "show_smap(")
         log.info("  -> OK: __show_smap diubah menjadi show_smap.")
 
-    # 3. Hapus logika pkeys (x86 specific)
+    # 3. Purgasi arsitektur x86 (pkeys) pada arm64
     if "arch_pkeys_enabled()" in data:
         data = re.sub(r'[ \t]*if \(arch_pkeys_enabled\(\)\)\s*\n[ \t]*seq_printf\([^;]+;\n', "", data)
-        # Fallback penghapusan baris jika regex gagal
         lines = [line for line in data.split("\n") if "arch_pkeys_enabled" not in line and "vma_pkey" not in line]
         data = "\n".join(lines)
         log.info("  -> OK: arch_pkeys_enabled (x86 logic) dihapus.")
 
-    # 4. Injeksi bypass_orig_flow TANPA menghitung kurung kurawal (Metode Aman)
-    # Mencari definisi fungsi show_smap, lalu mencari titik return terakhir atau bracket penutup
+    # 4. Injeksi bypass_orig_flow: dengan Lexical State Machine (AST Lexer Level)
     if "goto bypass_orig_flow;" in data and "bypass_orig_flow:" not in data:
-        # Cari blok fungsi show_smap
-        smap_match = re.search(r"static int show_smap\([^)]+\)\n\{(.+?)\n\}", data, re.DOTALL)
-        if smap_match:
-            func_body = smap_match.group(1)
-            # Menyisipkan label tepat sebelum 'return 0;' atau di akhir blok
-            if "return 0;" in func_body:
-                modified_body = func_body.replace("return 0;", "bypass_orig_flow: ;\n\treturn 0;", 1)
-                data = data.replace(func_body, modified_body)
-                log.info("  -> SUCCESS: Label bypass_orig_flow berhasil disuntikkan secara statis.")
+        match_start = re.search(r"(static\s+int\s+show_smap\([^)]+\)\s*\{)", data)
+        if match_start:
+            start_idx = match_start.end()
+            brace_count = 1
+            i = start_idx
+            
+            # State variables for ignoring braces in strings and comments
+            in_string = False
+            in_char = False
+            in_line_comment = False
+            in_block_comment = False
+            
+            # Parsing Lexical: mengabaikan `}` jika ada di komentar atau string
+            while i < len(data) and brace_count > 0:
+                if in_line_comment:
+                    if data[i] == '\n':
+                        in_line_comment = False
+                elif in_block_comment:
+                    if data[i:i+2] == '*/':
+                        in_block_comment = False
+                        i += 1
+                elif in_string:
+                    if data[i] == '\\':
+                        i += 1  # escape char
+                    elif data[i] == '"':
+                        in_string = False
+                elif in_char:
+                    if data[i] == '\\':
+                        i += 1  # escape char
+                    elif data[i] == "'":
+                        in_char = False
+                else:
+                    if data[i:i+2] == '//':
+                        in_line_comment = True
+                    elif data[i:i+2] == '/*':
+                        in_block_comment = True
+                    elif data[i] == '"':
+                        in_string = True
+                    elif data[i] == "'":
+                        in_char = True
+                    elif data[i] == '{':
+                        brace_count += 1
+                    elif data[i] == '}':
+                        brace_count -= 1
+                i += 1
+                
+            if brace_count == 0:
+                end_idx = i - 1  # Index absolut penutup fungsi '}'
+                func_body = data[start_idx:end_idx]
+                
+                # Injeksi aman di pangkal exit point (return 0;)
+                last_return_idx = func_body.rfind("return 0;")
+                if last_return_idx != -1:
+                    modified_body = (
+                        func_body[:last_return_idx] + 
+                        "bypass_orig_flow: ;\n\treturn 0;" + 
+                        func_body[last_return_idx+9:]
+                    )
+                else:
+                    modified_body = func_body + "\nbypass_orig_flow: ;\n"
+                
+                data = data[:start_idx] + modified_body + data[end_idx:]
+                log.info("  -> SUCCESS: Label bypass_orig_flow disuntikkan secara deterministik dengan Lexer State Machine.")
             else:
-                log.warning("  -> WARNING: Gagal menemukan return 0; dalam show_smap.")
+                log.error("  -> CRITICAL: Brace imbalance terdeteksi di show_smap. File kernel korup secara sintaks.")
         else:
-            log.warning("  -> WARNING: Gagal mengekstrak blok fungsi show_smap. Label bypass_orig_flow dilewati.")
+            log.warning("  -> WARNING: Deklarasi fungsi show_smap tidak ditemukan.")
     elif "bypass_orig_flow:" in data:
         log.info("  -> OK: Label bypass_orig_flow sudah ada.")
 
     write_file(file_path, data)
 
 def spot_check_includes(kernel_dir: Path):
-    log.info("Memeriksa kelengkapan include susfs.h ...")
+    log.info("Memeriksa integrasi struktural susfs.h ...")
     checks = [
         ("fs/open.c",          "#include <linux/susfs.h>", "#include <linux/fs.h>"),
         ("fs/stat.c",          "#include <linux/susfs.h>", "#include <linux/fs.h>"),
@@ -141,22 +193,22 @@ def spot_check_includes(kernel_dir: Path):
                 if anc in fc:
                     fc = fc.replace(anc, f"{anc}\n{need}", 1)
                     write_file(fp, fc)
-                    log.info(f"  -> SUCCESS {fp.name}: {need} disuntikkan.")
+                    log.info(f"  -> SUCCESS {fp.name}: {need} disuntikkan secara implisit.")
                     break
         else:
-            log.info(f"  -> OK {fp.name}: Tidak perlu injeksi.")
+            log.info(f"  -> OK {fp.name}: Tidak memerlukan re-injeksi.")
 
 if __name__ == "__main__":
-    # Eksekusi di direktori saat ini (sesuai workspace kamu di /workspaces/android_kernelmi_sm6150)
+    # Orkestrasi dimulai secara relatif terhadap current working directory (CWD)
     root_dir = Path.cwd()
-    log.info(f"Memulai rutinitas SUSFS Patching di: {root_dir}")
+    log.info(f"Menginisialisasi SUSFS Vulnerability Patcher Engine di: {root_dir}")
     
     try:
         patch_sys_c(root_dir)
         patch_cmdline_c(root_dir)
         patch_task_mmu_c(root_dir)
         spot_check_includes(root_dir)
-        log.info("Semua modifikasi manual selesai dieksekusi tanpa error.")
+        log.info("Modifikasi C-Source Code dieksekusi secara paripurna dan stabil.")
     except Exception as e:
-        log.critical(f"Terjadi eksepsi tidak terduga: {e}", exc_info=True)
+        log.critical(f"Terjadi interupsi level sistemik: {e}", exc_info=True)
         sys.exit(1)
