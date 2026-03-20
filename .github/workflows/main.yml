@@ -210,6 +210,7 @@ jobs:
           # Write susfs_manual_fix.py fresh setiap run — tidak bergantung pada repo
           # Fix known rejects — gunakan susfs_manual_fix.py dari repo
           python3 ${{ github.workspace }}/susfs_manual_fix.py
+          
           # Append SUSFS configs ke defconfig
           printf '%s\n' \
             'CONFIG_KSU_SUSFS=y' \
@@ -256,10 +257,10 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
 
-          # ── -O3 optimization ─────────────────────────────────────────
-          echo "Applying -O3 flags..."
-          sed -i 's/KBUILD_CFLAGS\s\++=\s\+-O2/KBUILD_CFLAGS   += -O3/g' Makefile
-          sed -i 's/LDFLAGS\s\++=\s\+-O2/LDFLAGS += -O3/g' Makefile
+          # ── NATIVE -O2 OPTIMIZATION ──────────────────────────────────
+          echo "Preserving Native -O2 flags for absolute stability..."
+          # Tidak perlu manipulasi Makefile secara paksa. Kernel Kbuild 
+          # secara default (native) sudah diatur untuk menggunakan -O2.
 
           # ── LTO — hanya untuk non-KSU_NEXT ───────────────────────────
           # KSU_NEXT pakai manual inline hook, tidak kompatibel dengan LTO
@@ -317,7 +318,7 @@ jobs:
           git clone -q https://github.com/RapliVx/AnyKernel3.git -b sweet AnyKernel3
 
           cat > AnyKernel3/banner << 'EOF'
-           SORY                                  
+           SORY                                 
            QXQVYXY                               
            SNRXWYXZ                         RNKJOY          
             YXYYYYYYXY                  PLOSUYXYOXNJCV          
@@ -338,10 +339,10 @@ jobs:
                                       VYTRULUM         ZYWVWXZ   
                                       WUVXSROP           YWWY    
                                        YTQZLNR                   
-                                       PURTWU                   
-                                       SOXXTU                   
-                                        TQOSU                   
-                                        YXXWX                   
+                                       PURTWU                    
+                                       SOXXTU                    
+                                        TQOSU                    
+                                        YXXWX                    
           
            FranxxCORE // MAMBOSU PROTOCOL
            BY RapliVX
@@ -377,7 +378,7 @@ jobs:
             | **AOSP** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ❌ |
             | **MIUI** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ✅ |
 
-            *Synchronization Ratio: 200% // -O3 + Full SUSFS*
+            *Synchronization Ratio: 100% // Native -O2 + Full SUSFS*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
