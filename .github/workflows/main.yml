@@ -18,9 +18,9 @@ on:
 
 env:
   # --- NERV HQ CONFIGURATION ---
-  KERNEL_NAME: "FranxxCORE"
+  KERNEL_NAME: "EviLZoNE"
   DEVICE: "Sweet"
-  CODENAME: "AHumanWorks"
+  CODENAME: "ArCHDeVIL"
   DEFCONFIG: "sweet_defconfig"
   CLANG_VER: "r547379"
   CLANG_URL: "https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r547379.tar.gz"
