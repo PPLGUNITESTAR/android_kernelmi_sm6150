@@ -1,0 +1,468 @@
+name: "Build Kernel"
+
+# ------------------------------------------------------------------
+# INPUT: KSU selector dipilih saat trigger workflow
+# ------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_selector:
+        description: "KernelSU Variant"
+        required: true
+        default: "NONE"
+        type: choice
+        options:
+          - NONE
+          - KSU_BLXX
+          - KSU_NEXT
+
+env:
+  # --- NERV HQ CONFIGURATION ---
+  KERNEL_NAME: "FranxxCORE"
+  DEVICE: "Sweet"
+  CODENAME: "AHumanWorks"
+  DEFCONFIG: "sweet_defconfig"
+  CLANG_VER: "r547379"
+  CLANG_URL: "https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r547379.tar.gz"
+
+  # --- MAGI SYSTEM IDENTITY ---
+  KBUILD_BUILD_USER: "RapliVX"
+  KBUILD_BUILD_HOST: "NyarchLinux"
+  TZ: "Asia/Jakarta"
+
+  # --- SECURITY CLEARANCE ---
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+  # --- KSU SOURCES (ported from build.sh) ---
+  KSU_BLXX_SETUP_URI: "https://github.com/backslashxx/KernelSU/raw/refs/heads/master/kernel/setup.sh"
+  KSU_BLXX_BRANCH: "master"
+  KSU_NEXT_SETUP_URI: "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+  KSU_NEXT_BRANCH: "legacy_susfs"
+  KSU_NEXT_HOOK_PATCH: "https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd/raw/refs/heads/mainline/Patches/susfs_inline_hook_patches.sh"
+  KSU_UMOUNT_PATCH: "https://github.com/tbyool/android_kernel_xiaomi_sm6150/commit/64db0dfa2f8aa6c519dbf21eb65c9b89643cda3d.patch"
+  KSU_KPATCH_FIX: "https://github.com/TheSillyOk/kernel_ls_patches/raw/refs/heads/master/kpatch_fix.patch"
+
+  # --- SUSFS (simonpunk/susfs4ksu, kernel-4.14) ---
+  SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
+  SUSFS_BRANCH: "kernel-4.14"
+
+jobs:
+  # ------------------------------------------------------------------
+  # PHASE 0: PREPARATION (ENVIRONMENT SETUP)
+  # ------------------------------------------------------------------
+  setup_env:
+    name: "🛠️ PREPARE // ENVIRONMENT"
+    runs-on: ubuntu-22.04
+    steps:
+      - name: "⚡ [CACHE] :: CLANG_TOOLCHAIN"
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: aosp-clang
+          key: ${{ runner.os }}-clang-${{ env.CLANG_VER }}
+
+      - name: "🔧 [DOWNLOAD] :: CLANG_TOOLCHAIN"
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading Clang..."
+          wget -q ${{ env.CLANG_URL }} -O aosp-clang.tar.gz
+          mkdir -p aosp-clang
+          tar -xf aosp-clang.tar.gz -C aosp-clang
+          rm -f aosp-clang.tar.gz
+
+  # ------------------------------------------------------------------
+  # PHASE 1: PARALLEL SYNCHRONIZATION (MATRIX BUILD)
+  # Matrix: AOSP vs MIUI — KSU ditentukan dari workflow_dispatch input
+  # ------------------------------------------------------------------
+  synchronization:
+    name: "🛡️ ${{ matrix.unit }} // BUILD"
+    needs: setup_env
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - unit: "UNIT-00 (AOSP)"
+            variant: "AOSP"
+            patch_miui: false
+          - unit: "UNIT-01 (MIUI)"
+            variant: "MIUI"
+            patch_miui: true
+
+    steps:
+      - name: "⬢ [INIT] :: SOURCE_CHECKOUT"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "⚡ [RESTORE] :: CLANG_TOOLCHAIN"
+        uses: actions/cache@v4
+        with:
+          path: aosp-clang
+          key: ${{ runner.os }}-clang-${{ env.CLANG_VER }}
+          fail-on-cache-miss: true
+
+      - name: "⚡ [CACHE] :: CCACHE_ACCELERATION"
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-${{ matrix.variant }}-${{ inputs.ksu_selector }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ matrix.variant }}-${{ inputs.ksu_selector }}-
+            ${{ runner.os }}-ccache-${{ matrix.variant }}-
+            ${{ runner.os }}-ccache-
+
+      - name: "⬢ [SYSTEM] :: DEPENDENCIES"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+          git libncurses5-dev libssl-dev libxml2 libxml2-utils lzop make \
+          python3 python3-pip unzip zip zlib1g-dev
+
+      - name: "⚙️ [CONFIG] :: CCACHE_SETUP"
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          ccache -M 2G
+          ccache -o compression=true
+          ccache -o compression_level=1
+          ccache -z
+
+      # ----------------------------------------------------------------
+      # KSU: NONE — purge semua CONFIG_KSU dari defconfig
+      # ----------------------------------------------------------------
+      - name: "🧹 [MOD] :: KSU_PURGE"
+        if: inputs.ksu_selector == 'NONE'
+        run: |
+          echo "KSU selector: NONE — purging KSU configs..."
+          sed -i '/CONFIG_KSU/d' arch/arm64/configs/${{ env.DEFCONFIG }}
+
+      # ----------------------------------------------------------------
+      # KSU: KSU_BLXX (backslashxx/KernelSU, hookless mode)
+      # ----------------------------------------------------------------
+      - name: "🧬 [MOD] :: KSU_BLXX_INTEGRATION"
+        if: inputs.ksu_selector == 'KSU_BLXX'
+        run: |
+          echo "⚠️ INITIATING KSU_BLXX PROTOCOL ..."
+
+          # apply_patch: download ke file dulu lalu patch --batch --forward
+          # --batch  = jangan prompt interaktif sama sekali
+          # --forward = skip kalau patch sudah applied (reversed detected), bukan error
+          apply_patch() {
+            local URL="$1"
+            local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
+            wget -q "$URL" -O "$PATCHFILE"
+            patch -p1 --fuzz=3 --batch --forward < "$PATCHFILE" || true
+            rm -f "$PATCHFILE"
+          }
+          apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
+          apply_patch "${{ env.KSU_KPATCH_FIX }}"
+
+          # Setup KernelSU (hookless mode)
+          curl -LSs "${{ env.KSU_BLXX_SETUP_URI }}" | bash -s ${{ env.KSU_BLXX_BRANCH }}
+
+          # Manual config enablement
+          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_TAMPER_SYSCALL_TABLE=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KRETPROBES=y
+          CONFIG_HAVE_SYSCALL_TRACEPOINTS=y
+          EOF
+
+      # ----------------------------------------------------------------
+      # KSU: KSU_NEXT (KernelSU-Next, manual hook mode)
+      # ----------------------------------------------------------------
+      - name: "🧬 [MOD] :: KSU_NEXT_INTEGRATION"
+        if: inputs.ksu_selector == 'KSU_NEXT'
+        run: |
+          echo "⚠️ INITIATING KSU_NEXT PROTOCOL ..."
+
+          # apply_patch: download ke file dulu lalu patch --batch --forward
+          # --batch  = jangan prompt interaktif sama sekali
+          # --forward = skip kalau patch sudah applied (reversed detected), bukan error
+          apply_patch() {
+            local URL="$1"
+            local PATCHFILE=$(mktemp /tmp/kpatch.XXXXXX.patch)
+            wget -q "$URL" -O "$PATCHFILE"
+            patch -p1 --fuzz=3 --batch --forward < "$PATCHFILE" || true
+            rm -f "$PATCHFILE"
+          }
+          apply_patch "${{ env.KSU_UMOUNT_PATCH }}"
+          apply_patch "${{ env.KSU_KPATCH_FIX }}"
+
+          # Apply inline hook patch
+          curl -LSs "${{ env.KSU_NEXT_HOOK_PATCH }}" | bash
+
+          # Setup KernelSU-Next
+          curl -LSs "${{ env.KSU_NEXT_SETUP_URI }}" | bash -s ${{ env.KSU_NEXT_BRANCH }}
+
+          # Manual config enablement
+          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
+          CONFIG_KSU=y
+          KSU_MANUAL_HOOK=y
+          EOF
+
+      # ----------------------------------------------------------------
+      # SUSFS — apply untuk KSU_BLXX dan KSU_NEXT
+      # Sumber: simonpunk/susfs4ksu kernel-4.14
+      # ----------------------------------------------------------------
+      - name: "🩹 [PATCH] :: SUSFS_INTEGRATION"
+        if: inputs.ksu_selector != 'NONE'
+        run: |
+          echo "⚠️ APPLYING SUSFS (simonpunk/susfs4ksu, kernel-4.14) ..."
+          git clone -q --depth=1 -b "${{ env.SUSFS_BRANCH }}" "${{ env.SUSFS_REPO }}" susfs4ksu
+
+          # Step 1: Copy SUSFS source files langsung — zero patch conflict
+          echo "Copying SUSFS source files..."
+          cp -v susfs4ksu/kernel_patches/fs/susfs.c                   fs/
+          cp -v susfs4ksu/kernel_patches/include/linux/susfs.h        include/linux/
+          cp -v susfs4ksu/kernel_patches/include/linux/susfs_def.h    include/linux/
+
+          # Step 2: KSU-side enablement patch (ke folder KernelSU jika ada)
+          KSU_ENABLE_PATCH="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          if [ -f "$KSU_ENABLE_PATCH" ] && [ -d "KernelSU" ]; then
+            echo "Applying KSU-side SUSFS enablement patch..."
+            patch -p1 -d KernelSU < "$KSU_ENABLE_PATCH" --fuzz=3 || {
+              echo "⚠️ KSU-side patch had issues, continuing..."
+            }
+          fi
+
+          # Step 3: Apply kernel-side SUSFS patch
+          SUSFS_KPATCH="susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch"
+          echo "Applying kernel-side SUSFS patch..."
+          patch -p1 --fuzz=3 < "$SUSFS_KPATCH" 2>&1 | tee /tmp/susfs_patch.log || PATCH_FAILED=1
+
+          # Step 4: Kalau ada .rej — dump ke log dulu sebelum apapun
+          REJ_COUNT=$(find . -name "*.rej" | wc -l)
+          if [ "$REJ_COUNT" -gt 0 ]; then
+            echo ""
+            echo "════════════════════════════════════════════════════════"
+            echo "  ⚠️  $REJ_COUNT REJECT FILE(S) DETECTED — DUMPING CONTENT"
+            echo "════════════════════════════════════════════════════════"
+            find . -name "*.rej" | sort | while read REJ; do
+              echo ""
+              echo "┌─────────────────────────────────────────"
+              echo "│ FILE: $REJ"
+              echo "└─────────────────────────────────────────"
+              cat "$REJ"
+              echo ""
+            done
+            echo "════════════════════════════════════════════════════════"
+            echo "  Salin output di atas dan share untuk manual fix."
+            echo "════════════════════════════════════════════════════════"
+
+            # Kumpulkan semua .rej ke satu folder untuk di-upload sebagai artifact
+            mkdir -p /tmp/susfs_rejects
+            find . -name "*.rej" | while read REJ; do
+              # Flatten path: fs/proc/task_mmu.c.rej -> fs__proc__task_mmu.c.rej
+              FLAT=$(echo "$REJ" | sed 's|^\./||; s|/|__|g')
+              cp "$REJ" "/tmp/susfs_rejects/$FLAT"
+            done
+          else
+            echo "✅ Patch applied cleanly, no rejects."
+          fi
+
+          # Exit kalau patch benar-benar gagal
+          if [ "${PATCH_FAILED}" = "1" ]; then
+            echo "❌ SUSFS patch failed. Check reject dump above."
+            exit 1
+          fi
+
+          # Step 5: Append SUSFS configs ke defconfig
+          echo "Appending SUSFS configs to defconfig..."
+          cat >> arch/arm64/configs/${{ env.DEFCONFIG }} << 'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=n
+          CONFIG_KSU_SUSFS_SUS_MOUNT=n
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=n
+          EOF
+
+          echo "✅ SUSFS integration complete."
+
+      - name: "📤 [DEBUG] :: UPLOAD_SUSFS_REJECTS"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-rejects-${{ matrix.variant }}
+          path: /tmp/susfs_rejects/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      # ----------------------------------------------------------------
+      # MIUI DT dimension patch
+      # ----------------------------------------------------------------
+      - name: "🩹 [PATCH] :: MIUI_OPTIMIZATION"
+        if: matrix.patch_miui == true
+        run: |
+          python3 -c "
+          import os, re
+          targets = ['dsi-panel-k6-38-0c-0a-fhd-dsc-video.dtsi', 'dsi-panel-k6-38-0e-0b-fhd-dsc-video.dtsi']
+          for root, dirs, files in os.walk('.'):
+              for file in files:
+                  if file in targets:
+                      path = os.path.join(root, file)
+                      with open(path, 'r') as f: content = f.read()
+                      content = re.sub(r'qcom,mdss-pan-physical-width-dimension\s*=\s*<[0-9]+>;',  'qcom,mdss-pan-physical-width-dimension = <695>;',  content)
+                      content = re.sub(r'qcom,mdss-pan-physical-height-dimension\s*=\s*<[0-9]+>;', 'qcom,mdss-pan-physical-height-dimension = <1546>;', content)
+                      with open(path, 'w') as f: f.write(content)
+                      print(f'Patched MIUI dimensions: {path}')
+          "
+
+      # ----------------------------------------------------------------
+      # COMPILE
+      # ----------------------------------------------------------------
+      - name: "⚔️ [COMPILE] :: KERNEL_BUILD"
+        run: |
+          export PATH="${{ github.workspace }}/aosp-clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          # ── O3 optimization ──────────────────────────────────────────
+          echo "Applying -O3 optimization flags..."
+          sed -i 's/KBUILD_CFLAGS\s\++=\s\+-O2/KBUILD_CFLAGS   += -O3/g' Makefile
+          sed -i 's/LDFLAGS\s\++=\s\+-O2/LDFLAGS += -O3/g' Makefile
+
+          # ── LTO — hanya untuk non-KSU_NEXT ───────────────────────────
+          # LTO tidak kompatibel dengan KSU_NEXT manual hook (inline hook conflict)
+          if [ "${{ inputs.ksu_selector }}" != "KSU_NEXT" ]; then
+            echo "Enabling LTO_CLANG (non-KSU_NEXT build)..."
+            echo "CONFIG_LTO_CLANG=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
+            echo "CONFIG_LTO_CLANG_THIN=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
+            # Pastikan full LTO tidak konflik dengan thin
+            sed -i '/CONFIG_LTO_CLANG_FULL/d' arch/arm64/configs/${{ env.DEFCONFIG }}
+          else
+            echo "Skipping LTO for KSU_NEXT build (inline hook incompatibility)."
+          fi
+
+          make O=out ${{ env.DEFCONFIG }}
+
+          make -j$(nproc --all) O=out \
+            LLVM=1 LLVM_IAS=1 CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.gz dtbo.img dtb.img
+
+      - name: "📊 [STATS] :: CCACHE_REPORT"
+        run: ccache -s
+
+      - name: "📤 [UPLOAD] :: ARTIFACTS"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}-${{ inputs.ksu_selector }}-unit
+          path: |
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/dtb.img
+            out/arch/arm64/boot/dtbo.img
+          compression-level: 9
+
+  # ------------------------------------------------------------------
+  # PHASE 2: DEPLOYMENT (ZIPPING & RELEASING)
+  # ------------------------------------------------------------------
+  human-instrumentality:
+    name: "🧬 PROTOCOL: FINAL_DOGMA"
+    runs-on: ubuntu-latest
+    needs: [synchronization]
+    permissions:
+      contents: write
+
+    steps:
+      - name: "📥 [COLLECT] :: ARTIFACTS"
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: "📦 [PACKAGE] :: ANYKERNEL3_ZIP"
+        run: |
+          mkdir -p release_zips
+          git clone -q https://github.com/RapliVx/AnyKernel3.git -b sweet AnyKernel3
+
+          cat > AnyKernel3/banner << 'EOF'
+           SORY                                  
+           QXQVYXY                               
+           SNRXWYXZ                         RNKJOY          
+            YXYYYYYYXY                  PLOSUYXYOXNJCV          
+              YXY YXYXSRV            VTV LZUKGLDDWPARAS          
+                YXYYYVUUUYY        QEAAAIXPNOJCEDLTAQAR          
+                  YYYVUVT YXY     WLFPSNGPNKTLJNAUIXCHV          
+                    YWQYUPTSJISPLSQAAEPHGFWGLEAJPMLM              
+                      TQR RPKJHFPIVQQLYMCFTBIAJYPPNP              
+                        RNTSFMGHPMAAAAKUFJURFL VRXNT              
+                          WUONRTOAFGQRMLTKMOOPWWTPUVQRW          
+                            XWXWOAAANOLTTMJVTMWZXXYSVTU VTV      
+                              PMXPVWRSUSXSSSYOTVSUYURSXYTYSY      
+                              LVNTOWJCPNUMUSWMSILQYXXYZXVSXWX    
+                              QLPQGJMYNJXPSSMWSVPOKRZXYY YWXTW   
+                                  WUW QHSLTUVQPJNRSO YZZVTYTXU   
+                                      UIKJUOMTOSULKR ZYYUXTYVW   
+                                      VTMTPGSJ         XVUYVYZ   
+                                      VYTRULUM         ZYWVWXZ   
+                                      WUVXSROP           YWWY    
+                                       YTQZLNR                   
+                                       PURTWU                   
+                                       SOXXTU                   
+                                        TQOSU                   
+                                        YXXWX                   
+          
+           FranxxCORE // MAMBOSU PROTOCOL
+           BY RapliVX
+          EOF
+
+          for DIR in ./artifacts/*-unit; do
+            VARIANT=$(basename "$DIR" -unit)
+            echo "Packaging $VARIANT..."
+            cp -f "$DIR/Image.gz"  AnyKernel3/
+            cp -f "$DIR/dtb.img"   AnyKernel3/
+            cp -f "$DIR/dtbo.img"  AnyKernel3/
+            cd AnyKernel3
+            zip -r1 "../release_zips/${KERNEL_NAME}-${VARIANT}-${CODENAME}-$(date +'%Y%m%d').zip" . -x ".git/*" -x "README.md"
+            cd ..
+          done
+
+      - name: "⬆️ [RELEASE] :: GITHUB_RELEASE"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "EVA-${{ github.run_number }}"
+          name: "ProjectEVA: MAMBOSU [Run ${{ github.run_number }}] [${{ inputs.ksu_selector }}]"
+          files: release_zips/*.zip
+          body: |
+            ### ⚠️ NERV SECURITY CLEARANCE REQUIRED
+            **Mission:** Kernel Instrumentality
+            **Device:** Redmi Note 10 Pro (sweet)
+            **Compiler:** Clang ${{ env.CLANG_VER }}
+            **KSU Variant:** `${{ inputs.ksu_selector }}`
+
+            #### 📦 DEPLOYED UNITS:
+            | Variant | KSU | SUSFS | MIUI Patch |
+            | :--- | :---: | :---: | :---: |
+            | **AOSP** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ❌ |
+            | **MIUI** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ✅ |
+
+            *Synchronization Ratio: 200%*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "📡 [NOTIFY] :: TELEGRAM_BOT"
+        if: success()
+        run: |
+          MSG="<b>🚨 MAGI SYSTEM // MISSION COMPLETE 🚨</b>%0A%0A"
+          MSG+="<b>TARGET:</b> ProjectEVA MAMBOSU%0A"
+          MSG+="<b>KSU:</b> ${{ inputs.ksu_selector }}%0A"
+          MSG+="<b>UNITS:</b> 2 Variants Deployed (AOSP + MIUI)%0A"
+          MSG+="🔗 <a href='https://github.com/${{ github.repository }}/releases/tag/EVA-${{ github.run_number }}'>ACCESS DATA TERMINAL</a>"
+
+          curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT_ID" \
+            -d text="$MSG" \
+            -d parse_mode="HTML" \
+            -d disable_web_page_preview=true
