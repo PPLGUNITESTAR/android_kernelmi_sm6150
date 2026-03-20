@@ -1,7 +1,7 @@
 name: "Build Kernel"
 
 # ------------------------------------------------------------------
-# INPUT: KSU selector dipilih saat trigger workflow
+# INPUT: KSU selector & Build Variant Route
 # ------------------------------------------------------------------
 on:
   workflow_dispatch:
@@ -15,6 +15,11 @@ on:
           - NONE
           - KSU_BLXX
           - KSU_NEXT
+      build_miui:
+        description: "Build MIUI variant? (Uncheck to build AOSP ONLY)"
+        required: true
+        type: boolean
+        default: true
 
 env:
   # --- NERV HQ CONFIGURATION ---
@@ -48,12 +53,25 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # PHASE 0: PREPARATION (ENVIRONMENT SETUP)
+  # PHASE 0: PREPARATION & DYNAMIC ROUTING
   # ------------------------------------------------------------------
   setup_env:
     name: "🛠️ PREPARE // ENVIRONMENT"
     runs-on: ubuntu-22.04
+    outputs:
+      build_matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
+      - name: "🧮 [MATRIX] :: GENERATE_DYNAMIC_UNITS"
+        id: set-matrix
+        run: |
+          if [ "${{ inputs.build_miui }}" == "true" ]; then
+            echo "Meroute 2 unit target (AOSP + MIUI)..."
+            echo 'matrix=[{"unit":"UNIT-00 (AOSP)","variant":"AOSP","patch_miui":false},{"unit":"UNIT-01 (MIUI)","variant":"MIUI","patch_miui":true}]' >> $GITHUB_OUTPUT
+          else
+            echo "Meroute 1 unit target (AOSP Only)..."
+            echo 'matrix=[{"unit":"UNIT-00 (AOSP)","variant":"AOSP","patch_miui":false}]' >> $GITHUB_OUTPUT
+          fi
+
       - name: "⚡ [CACHE] :: CLANG_TOOLCHAIN"
         id: cache-clang
         uses: actions/cache@v4
@@ -79,14 +97,9 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
+      # Matrix kini dibaca secara dinamis (JSON Parsing)
       matrix:
-        include:
-          - unit: "UNIT-00 (AOSP)"
-            variant: "AOSP"
-            patch_miui: false
-          - unit: "UNIT-01 (MIUI)"
-            variant: "MIUI"
-            patch_miui: true
+        include: ${{ fromJson(needs.setup_env.outputs.build_matrix) }}
 
     steps:
       - name: "⬢ [INIT] :: SOURCE_CHECKOUT"
@@ -127,18 +140,12 @@ jobs:
           ccache -o compression_level=1
           ccache -z
 
-      # ----------------------------------------------------------------
-      # KSU: NONE — purge semua CONFIG_KSU dari defconfig
-      # ----------------------------------------------------------------
       - name: "🧹 [MOD] :: KSU_PURGE"
         if: inputs.ksu_selector == 'NONE'
         run: |
           echo "KSU selector: NONE — purging KSU configs..."
           sed -i '/CONFIG_KSU/d' arch/arm64/configs/${{ env.DEFCONFIG }}
 
-      # ----------------------------------------------------------------
-      # KSU: KSU_BLXX (backslashxx/KernelSU, hookless mode)
-      # ----------------------------------------------------------------
       - name: "🧬 [MOD] :: KSU_BLXX_INTEGRATION"
         if: inputs.ksu_selector == 'KSU_BLXX'
         run: |
@@ -166,9 +173,6 @@ jobs:
             'CONFIG_HAVE_SYSCALL_TRACEPOINTS=y' \
             >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
-      # ----------------------------------------------------------------
-      # KSU: KSU_NEXT (KernelSU-Next, manual hook mode)
-      # ----------------------------------------------------------------
       - name: "🧬 [MOD] :: KSU_NEXT_INTEGRATION"
         if: inputs.ksu_selector == 'KSU_NEXT'
         run: |
@@ -192,47 +196,30 @@ jobs:
             'KSU_MANUAL_HOOK=y' \
             >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
-      # ----------------------------------------------------------------
-      # SUSFS — JackA1ltman susfs_patch_to_4.14.patch
-      # Melalui Purgasi & Validasi Multi-Tahap (Heuristic Audit)
-      # ----------------------------------------------------------------
       - name: "🩹 [PATCH] :: SUSFS_INTEGRATION"
         if: inputs.ksu_selector != 'NONE'
         run: |
-          set -e # Aktivasi strict error handling
+          set -e
           echo "⚠️ [FASE 1] MENGINISIALISASI PROTOKOL SUSFS (manipvlator/msm-sm6150-cafified) ..."
           wget -q "${{ env.SUSFS_PATCH_URL }}" -O /tmp/susfs.patch
 
           echo "🔍 [FASE 2] Menerapkan patch upstream..."
-          # Kita izinkan patch berjalan. Jika ada hunk yang ditolak, eksekusi dilanjutkan agar Python Scanner dapat melakukan resolusi konflik secara rekayasa balik.
           patch -p1 --fuzz=5 --batch --forward < /tmp/susfs.patch || echo "⚠️ Peringatan: Ditemukan distorsi struktural (Rejects). Lexical Scanner akan mengambil alih penyesuaian AST."
 
           echo "🧠 [FASE 3] Mengeksekusi Lexical Brace Matching Scanner (susfs_manual_fix.py)..."
           if ! python3 ${{ github.workspace }}/susfs_manual_fix.py; then
-              echo "❌ [FATAL] Lexical Patcher Python gagal memvalidasi struktur C-Source. Kompilasi digagalkan secara sistemik!"
+              echo "❌ [FATAL] Lexical Patcher Python gagal memvalidasi struktur C-Source."
               exit 1
           fi
           
           echo "🔬 [FASE 4] Heuristic Audit: Memverifikasi integritas File Pasca-Injeksi..."
-          # Verifikasi level-Bash untuk memvalidasi absolutnya injeksi pada Abstract Syntax Tree.
-          if ! grep -q "susfs_spoof_uname" kernel/sys.c; then
-              echo "❌ [FATAL] Anomali terdeteksi: 'susfs_spoof_uname' gagal ditemukan di kernel/sys.c!"
-              exit 1
-          fi
-          
-          if ! grep -q "bypass_orig_flow:" fs/proc/task_mmu.c; then
-              echo "❌ [FATAL] Anomali terdeteksi: Label 'bypass_orig_flow:' absen dari resolusi fs/proc/task_mmu.c!"
-              exit 1
-          fi
-          
-          if ! grep -q "susfs_spoof_cmdline_or_bootconfig" fs/proc/cmdline.c; then
-              echo "❌ [FATAL] Anomali terdeteksi: Injeksi susfs_spoof_cmdline absen dari fs/proc/cmdline.c!"
-              exit 1
-          fi
+          if ! grep -q "susfs_spoof_uname" kernel/sys.c; then echo "❌ [FATAL] susfs_spoof_uname absen di kernel/sys.c!"; exit 1; fi
+          if ! grep -q "bypass_orig_flow:" fs/proc/task_mmu.c; then echo "❌ [FATAL] bypass_orig_flow: absen di fs/proc/task_mmu.c!"; exit 1; fi
+          if ! grep -q "susfs_spoof_cmdline_or_bootconfig" fs/proc/cmdline.c; then echo "❌ [FATAL] susfs_spoof_cmdline absen di fs/proc/cmdline.c!"; exit 1; fi
 
-          echo "✅ [AUDIT LULUS] Integritas struktural KSU/SUSFS terverifikasi 100% pada layer leksikal."
+          echo "✅ [AUDIT LULUS] Integritas struktural terverifikasi 100%."
 
-          echo "⚙️ [FASE 5] Menginjeksi parameter konfigurasi SUSFS ke dalam defconfig..."
+          echo "⚙️ [FASE 5] Menginjeksi parameter konfigurasi SUSFS..."
           printf '%s\n' \
             'CONFIG_KSU_SUSFS=y' \
             'CONFIG_KSU_SUSFS_SUS_PATH=n' \
@@ -247,11 +234,6 @@ jobs:
             'CONFIG_KSU_SUSFS_TRY_UMOUNT=n' \
             >> arch/arm64/configs/${{ env.DEFCONFIG }}
 
-          echo "✅ Protokol SUSFS Integration selesai dieksekusi secara paripurna."
-
-      # ----------------------------------------------------------------
-      # MIUI DT dimension patch
-      # ----------------------------------------------------------------
       - name: "🩹 [PATCH] :: MIUI_OPTIMIZATION"
         if: matrix.patch_miui == true
         run: |
@@ -269,22 +251,14 @@ jobs:
                       print(f'Patched MIUI dimensions: {path}')
           "
 
-      # ----------------------------------------------------------------
-      # COMPILE
-      # ----------------------------------------------------------------
       - name: "⚔️ [COMPILE] :: KERNEL_BUILD"
         run: |
           export PATH="${{ github.workspace }}/aosp-clang/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
 
-          # ── NATIVE -O2 OPTIMIZATION ──────────────────────────────────
           echo "Preserving Native -O2 flags for absolute stability..."
-          # Tidak perlu manipulasi Makefile secara paksa. Kernel Kbuild 
-          # secara default (native) sudah diatur untuk menggunakan -O2.
 
-          # ── LTO — hanya untuk non-KSU_NEXT ───────────────────────────
-          # KSU_NEXT pakai manual inline hook, tidak kompatibel dengan LTO
           if [ "${{ inputs.ksu_selector }}" != "KSU_NEXT" ]; then
             echo "Enabling CONFIG_LTO_CLANG_THIN..."
             printf '%s\n' \
@@ -380,36 +354,51 @@ jobs:
             cd ..
           done
 
+      - name: "📝 [DOCS] :: GENERATE_RELEASE_NOTES"
+        run: |
+          cat > release_notes.md << EOF
+          ### ⚠️ NERV SECURITY CLEARANCE REQUIRED
+          **Mission:** Kernel Instrumentality
+          **Device:** Redmi Note 10 Pro (sweet)
+          **Compiler:** Clang ${{ env.CLANG_VER }}
+          **KSU Variant:** \`${{ inputs.ksu_selector }}\`
+
+          #### 📦 DEPLOYED UNITS:
+          | Variant | KSU | SUSFS | LTO | MIUI Patch |
+          | :--- | :---: | :---: | :---: | :---: |
+          | **AOSP** | \`${{ inputs.ksu_selector }}\` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ❌ |
+          EOF
+
+          if [ "${{ inputs.build_miui }}" == "true" ]; then
+            echo "| **MIUI** | \`${{ inputs.ksu_selector }}\` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ✅ |" >> release_notes.md
+          fi
+
+          echo "" >> release_notes.md
+          echo "*Synchronization Ratio: 100% // Native -O2 + Full SUSFS + Adaptive Matrix*" >> release_notes.md
+
       - name: "⬆️ [RELEASE] :: GITHUB_RELEASE"
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "EVA-${{ github.run_number }}"
           name: "ProjectEVA: MAMBOSU [Run ${{ github.run_number }}] [${{ inputs.ksu_selector }}]"
           files: release_zips/*.zip
-          body: |
-            ### ⚠️ NERV SECURITY CLEARANCE REQUIRED
-            **Mission:** Kernel Instrumentality
-            **Device:** Redmi Note 10 Pro (sweet)
-            **Compiler:** Clang ${{ env.CLANG_VER }}
-            **KSU Variant:** `${{ inputs.ksu_selector }}`
-
-            #### 📦 DEPLOYED UNITS:
-            | Variant | KSU | SUSFS | LTO | MIUI Patch |
-            | :--- | :---: | :---: | :---: | :---: |
-            | **AOSP** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ❌ |
-            | **MIUI** | `${{ inputs.ksu_selector }}` | ${{ inputs.ksu_selector != 'NONE' && '✅' || '❌' }} | ${{ inputs.ksu_selector != 'KSU_NEXT' && '✅' || '❌' }} | ✅ |
-
-            *Synchronization Ratio: 100% // Native -O2 + Full SUSFS*
+          body_path: release_notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: "📡 [NOTIFY] :: TELEGRAM_BOT"
         if: success()
         run: |
+          if [ "${{ inputs.build_miui }}" == "true" ]; then
+            UNIT_TEXT="2 Variants Deployed (AOSP + MIUI)"
+          else
+            UNIT_TEXT="1 Variant Deployed (AOSP Only)"
+          fi
+
           MSG="<b>🚨 MAGI SYSTEM // MISSION COMPLETE 🚨</b>%0A%0A"
           MSG+="<b>TARGET:</b> ProjectEVA MAMBOSU%0A"
           MSG+="<b>KSU:</b> ${{ inputs.ksu_selector }}%0A"
-          MSG+="<b>UNITS:</b> 2 Variants Deployed (AOSP + MIUI)%0A"
+          MSG+="<b>UNITS:</b> $UNIT_TEXT%0A"
           MSG+="🔗 <a href='https://github.com/${{ github.repository }}/releases/tag/EVA-${{ github.run_number }}'>ACCESS DATA TERMINAL</a>"
 
           curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
